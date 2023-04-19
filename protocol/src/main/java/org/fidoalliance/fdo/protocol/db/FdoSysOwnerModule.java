@@ -3,20 +3,36 @@
 
 package org.fidoalliance.fdo.protocol.db;
 
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.lang.String;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLConnection;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.sql.Blob;
 import java.sql.SQLException;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Base64;
+import java.util.HashMap;
 import java.util.Map;
-import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.http.HttpEntity;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.logging.log4j.message.Message;
 import org.fidoalliance.fdo.protocol.Config;
-import org.fidoalliance.fdo.protocol.HttpClientSupplier;
 import org.fidoalliance.fdo.protocol.InternalServerErrorException;
 import org.fidoalliance.fdo.protocol.LoggerService;
 import org.fidoalliance.fdo.protocol.Mapper;
@@ -33,6 +49,7 @@ import org.fidoalliance.fdo.protocol.message.ServiceInfoQueue;
 import org.fidoalliance.fdo.protocol.message.StatusCb;
 import org.fidoalliance.fdo.protocol.serviceinfo.DevMod;
 import org.fidoalliance.fdo.protocol.serviceinfo.FdoSys;
+import org.h2.util.json.JSONObject;
 import org.hibernate.Session;
 import org.hibernate.Transaction;
 
@@ -41,9 +58,18 @@ import org.hibernate.Transaction;
  */
 public class FdoSysOwnerModule implements ServiceInfoModule {
 
+  private String serialnumber;
+  private Map<String, String> serialNumbers = new HashMap<>();
+  //private ThreadLocal<String> serialnumber = new ThreadLocal<>();
+  private String guid;  
+  private String ST;
+  private String securityToken;
+  private String updateStatus;
+  private String retrivedStatus = "registered" ;
+  private String hawkbitserver= "host.docker.internal";
 
   private final LoggerService logger = new LoggerService(FdoSysOwnerModule.class);
-
+ 
   @Override
   public String getName() {
     return FdoSys.NAME;
@@ -70,7 +96,6 @@ public class FdoSysOwnerModule implements ServiceInfoModule {
             activePair.setKeyName(FdoSys.ACTIVE);
             activePair.setValue(Mapper.INSTANCE.writeValue(true));
             queue.add(activePair);
-
           }
         }
       }
@@ -81,6 +106,11 @@ public class FdoSysOwnerModule implements ServiceInfoModule {
       case DevMod.KEY_ARCH:
         extra.getFilter().put(kvPair.getKey(),
             Mapper.INSTANCE.readValue(kvPair.getValue(), String.class));
+        break;
+      case DevMod.KEY_SN:
+        guid = state.getGuid().toString();
+        serialnumber =  Mapper.INSTANCE.readValue(kvPair.getValue(), String.class);
+        serialNumbers.put(guid, serialnumber);
         break;
       case FdoSys.STATUS_CB:
         if (state.isActive()) {
@@ -123,22 +153,32 @@ public class FdoSysOwnerModule implements ServiceInfoModule {
     }
     state.setExtra(AnyType.fromObject(extra));
   }
-
+  
+  /* Function to send the data to the linux client */
   @Override
   public void send(ServiceInfoModuleState state, ServiceInfoSendFunction sendFunction)
       throws IOException {
-
+     /*Check the filters and Que for other service modules to be executed */
     FdoSysModuleExtra extra = state.getExtra().covertValue(FdoSysModuleExtra.class);
+    
+    guid = state.getGuid().toString();
+    serialnumber = serialNumbers.get(guid);
+    securityToken = createHawkbitTarget(state,guid);
 
-    if (!extra.isLoaded() && infoReady(extra)) {
-      load(state, extra);
-      extra.setLoaded(true);
-    }
+    
+      createHawkbitConfig(extra);
+      writeHawkbitConfig(state,extra,securityToken,guid);
+      //wait for device to get registered
+      try {
+        Thread.sleep(5000);
+      } catch (InterruptedException e) {
+        e.printStackTrace();
+      }    
 
     while (extra.getQueue().size() > 0) {
       boolean sent = sendFunction.apply(extra.getQueue().peek());
       if (sent) {
-        checkWaiting(extra, Objects.requireNonNull(extra.getQueue().poll()));
+        checkWaiting(extra, extra.getQueue().poll());
       } else {
         break;
       }
@@ -147,11 +187,109 @@ public class FdoSysOwnerModule implements ServiceInfoModule {
       }
     }
     if (extra.getQueue().size() == 0 && !extra.isWaiting()) {
-      state.setDone(true);
+      updateStatus = confirmTargetRegistration(state, guid);
+      if (!updateStatus.equals(retrivedStatus)){
+        state.setDone(false);
+      }
+      else{
+        state.setDone(true);
+      }
     }
     state.setExtra(AnyType.fromObject(extra));
   }
 
+  /*create hawkbit target device and get security token */
+  protected String createHawkbitTarget(ServiceInfoModuleState state, String guid) throws IOException{
+    try {
+      //If you've set the HISTCONTROL environment variable to ignoreboth (which is usually set by default), commands with a leading space character will not be stored in the history (as well as duplicates).
+      ProcessBuilder processBuilder = new ProcessBuilder();
+      processBuilder.command("bash", "-c", "HISTCONTROL=ignoreboth; " +
+              "curl -k -u admin:admin \"https://" + hawkbitserver + "/rest/v1/targets\" -X POST -H \"Content-Type: application/json;charset=UTF-8\" -d '[{\"controllerId\":\"" + guid + "\",\"name\":\"" + serialnumber + "\",\"description\":\"Linutronix FDO_device\"}]' < /dev/null; " +
+              "get_securityToken=$(curl -k -u admin:admin \"https://" + hawkbitserver + "/rest/v1/targets/\"" + guid + "\"\" -X GET | jq '.securityToken'); " +
+              "ST=$(echo \"$get_securityToken\" | tr -d '\"'); " +
+              "echo $ST" );
+      processBuilder.redirectErrorStream(true);
+      Process process = processBuilder.start();
+
+      // read the output from the command
+      InputStream inputStream = process.getInputStream();
+      BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream));
+      String line;
+      while ((line = reader.readLine()) != null) {
+          ST = line; // reads the value of security Token
+          System.out.println(line);
+      }
+  } catch (Exception e) {
+      e.printStackTrace();
+  }
+    return ST;
+}
+
+/*crete hawkbit.config file */
+protected void createHawkbitConfig(FdoSysModuleExtra extra) throws IOException {
+  ServiceInfoKeyValuePair kv = new ServiceInfoKeyValuePair();
+  kv.setKeyName(FdoSys.FILEDESC);
+  String filename = "hawkbit.config";
+  kv.setValue(Mapper.INSTANCE.writeValue(filename));
+  extra.getQueue().add(kv);
+}
+
+/*write hawkbit.config file */
+protected void writeHawkbitConfig(ServiceInfoModuleState state,FdoSysModuleExtra extra, String securityToken, String guid ) throws IOException {
+  guid = state.getGuid().toString();
+  String CFG = "URL:https://"+ hawkbitserver +"\n"
+  + "ControllerId:"+ guid +" \n"
+  + "SecurityToken:"+ securityToken +"\n";
+
+    InputStream targetStream = new ByteArrayInputStream(CFG.getBytes());
+      try (InputStream input = targetStream) {
+        for (; ; ) {
+          byte[] data = new byte[state.getMtu() - 26];
+          int br = input.read(data);
+          if (br == -1) {
+            break;
+          }
+          ServiceInfoKeyValuePair kv = new ServiceInfoKeyValuePair();
+          kv.setKeyName(FdoSys.WRITE);
+
+          if (br < data.length) {
+            byte[] temp = data;
+            data = new byte[br];
+            System.arraycopy(temp, 0, data, 0, br);
+          }
+          kv.setValue(Mapper.INSTANCE.writeValue(data));
+          extra.getQueue().add(kv);
+        }
+      } 
+  }
+
+
+protected String confirmTargetRegistration(ServiceInfoModuleState state, String guid) throws IOException{
+  try {
+    //If you've set the HISTCONTROL environment variable to ignoreboth (which is usually set by default), commands with a leading space character will not be stored in the history (as well as duplicates).
+    guid = state.getGuid().toString();
+    ProcessBuilder processBuilder = new ProcessBuilder();
+    processBuilder.command("bash", "-c", "HISTCONTROL=ignoreboth; " +
+            "get_updateStatus=$(curl -k -u admin:admin \"https://" + hawkbitserver + "/rest/v1/targets/\"" + guid + "\"\" -X GET | jq '.updateStatus'); " +
+            "updateStatus=$(echo \"$get_updateStatus\" | tr -d '\"'); " +
+            "echo $updateStatus" );
+    processBuilder.redirectErrorStream(true);
+    Process process = processBuilder.start();
+
+    // read the output from the command
+    InputStream inputStream = process.getInputStream();
+    BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream));
+    String line;
+    while ((line = reader.readLine()) != null) {
+        updateStatus = line; // reads the value of updateStatus
+        System.out.println(line);
+    }
+    
+} catch (Exception e) {
+    e.printStackTrace();
+}
+return updateStatus;
+}
   protected void checkWaiting(FdoSysModuleExtra extra, ServiceInfoKeyValuePair kv) {
     switch (kv.getKey()) {
       case FdoSys.EXEC_CB:
@@ -163,17 +301,6 @@ public class FdoSysOwnerModule implements ServiceInfoModule {
       default:
         break;
     }
-  }
-
-  protected boolean infoReady(FdoSysModuleExtra extra) {
-    return extra.getFilter().containsKey(DevMod.KEY_DEVICE)
-        && extra.getFilter().containsKey(DevMod.KEY_OS)
-        && extra.getFilter().containsKey(DevMod.KEY_VERSION)
-        && extra.getFilter().containsKey(DevMod.KEY_ARCH);
-  }
-
-  protected boolean checkFilter(Map<String, String> devMap, Map<String, String> filterMap) {
-    return !devMap.entrySet().containsAll(filterMap.entrySet());
   }
 
   protected void onStatusCb(ServiceInfoModuleState state, FdoSysModuleExtra extra,
@@ -191,55 +318,6 @@ public class FdoSysOwnerModule implements ServiceInfoModule {
   protected void onEot(ServiceInfoModuleState state, FdoSysModuleExtra extra, EotResult result)
       throws IOException {
     logger.info("EOT:resultCode " + result.getResult());
-  }
-
-  protected void load(ServiceInfoModuleState state, FdoSysModuleExtra extra)
-      throws IOException {
-
-    if (!state.isActive()) {
-      return;
-    }
-
-    final Session session = HibernateUtil.getSessionFactory().openSession();
-    try {
-      Transaction trans = session.beginTransaction();
-      SystemPackage systemPackage =
-          session.find(SystemPackage.class, Long.valueOf(1));
-
-      if (systemPackage != null) {
-        String body = systemPackage.getData().getSubString(1,
-            Long.valueOf(systemPackage.getData().length()).intValue());
-        FdoSysInstruction[] instructions =
-            Mapper.INSTANCE.readJsonValue(body, FdoSysInstruction[].class);
-
-        boolean skip = false;
-        for (FdoSysInstruction instruction : instructions) {
-          if (instruction.getFilter() != null) {
-            skip = checkFilter(extra.getFilter(), instruction.getFilter());
-          }
-          if (skip) {
-            continue;
-          }
-
-          if (instruction.getFileDesc() != null) {
-            getFile(state, extra, instruction);
-          } else if (instruction.getExecArgs() != null) {
-            getExec(state, extra, instruction);
-          } else if (instruction.getExecCbArgs() != null) {
-            getExecCb(state, extra, instruction);
-          } else if (instruction.getFetch() != null) {
-            getFetch(state, extra, instruction);
-          }
-        }
-
-      }
-      trans.commit();
-    } catch (SQLException e) {
-      logger.error("SQL Exception" + e.getMessage());
-      throw new InternalServerErrorException(e);
-    } finally {
-      session.close();
-    }
   }
 
   protected void getExec(ServiceInfoModuleState state,
@@ -268,123 +346,6 @@ public class FdoSysOwnerModule implements ServiceInfoModule {
     kv.setValue(Mapper.INSTANCE.writeValue(instruction.getFetch()));
     extra.getQueue().add(kv);
   }
-
-  protected void getDbFile(ServiceInfoModuleState state,
-      FdoSysModuleExtra extra,
-      FdoSysInstruction instruction) throws IOException {
-    String resource = instruction.getResource();
-    final Session session = HibernateUtil.getSessionFactory().openSession();
-    try {
-      Transaction trans = session.beginTransaction();
-      resource = resource.replace("$(guid)", state.getGuid().toString());
-
-      // Query database table SYSTEM_RESOURCE for filename Key
-      SystemResource sviResource = session.get(SystemResource.class, resource);
-
-      if (sviResource != null) {
-        Blob blobData = sviResource.getData();
-        try (InputStream input = blobData.getBinaryStream()) {
-          for (; ; ) {
-            byte[] data = new byte[state.getMtu() - 26];
-            int br = input.read(data);
-            if (br == -1) {
-              break;
-            }
-            ServiceInfoKeyValuePair kv = new ServiceInfoKeyValuePair();
-            kv.setKeyName(FdoSys.WRITE);
-
-            if (br < data.length) {
-              byte[] temp = data;
-              data = new byte[br];
-              System.arraycopy(temp, 0, data, 0, br);
-            }
-            kv.setValue(Mapper.INSTANCE.writeValue(data));
-            extra.getQueue().add(kv);
-          }
-        } catch (SQLException throwables) {
-          logger.error("SQL Exception " + throwables.getMessage());
-          throw new InternalServerErrorException(throwables);
-        }
-      } else {
-        logger.error("SVI resource missing");
-        throw new InternalServerErrorException("svi resource missing " + resource);
-      }
-      trans.commit();
-
-    } finally {
-      session.close();
-    }
-
-  }
-
-  protected void getUrlFile(ServiceInfoModuleState state,
-      FdoSysModuleExtra extra,
-      FdoSysInstruction instruction) throws IOException {
-    String resource = instruction.getResource();
-    resource = resource.replace("$(guid)", state.getGuid().toString());
-
-    try (CloseableHttpClient httpClient = Config.getWorker(ServiceInfoHttpClientSupplier.class)
-        .get()) {
-
-      logger.info("HTTP(S) GET: " + resource);
-      HttpGet httpRequest = new HttpGet(resource);
-      try (CloseableHttpResponse httpResponse = httpClient.execute(httpRequest)) {
-        logger.info(httpResponse.getStatusLine().toString());
-        if (httpResponse.getStatusLine().getStatusCode() != 200) {
-          throw new InternalServerErrorException(httpResponse.getStatusLine().toString());
-        }
-        HttpEntity entity = httpResponse.getEntity();
-        if (entity != null) {
-          logger.info("content length is " + entity.getContentLength());
-
-          try (InputStream input = entity.getContent()) {
-            logger.info("reading data");
-            for (; ; ) {
-              byte[] data = new byte[state.getMtu() - 26];
-              int br = input.read(data);
-              if (br == -1) {
-                break;
-              }
-              ServiceInfoKeyValuePair kv = new ServiceInfoKeyValuePair();
-              kv.setKeyName(FdoSys.WRITE);
-
-              if (br < data.length) {
-                byte[] temp = data;
-                data = new byte[br];
-                System.arraycopy(temp, 0, data, 0, br);
-              }
-              kv.setValue(Mapper.INSTANCE.writeValue(data));
-              extra.getQueue().add(kv);
-            }
-          }
-        }
-      }
-    } catch (RuntimeException e) {
-      logger.error("Runtime Exception" +  e.getMessage());
-      throw new InternalServerErrorException(e);
-    } catch (Exception e) {
-      logger.error("failed to get http content" + e.getMessage());
-      throw new InternalServerErrorException(e);
-    }
-    logger.info("http content downloaded successfully!");
-
-  }
-
-  protected void getFile(ServiceInfoModuleState state,
-      FdoSysModuleExtra extra,
-      FdoSysInstruction instruction)
-      throws IOException {
-
-    ServiceInfoKeyValuePair kv = new ServiceInfoKeyValuePair();
-    kv.setKeyName(FdoSys.FILEDESC);
-    kv.setValue(Mapper.INSTANCE.writeValue(instruction.getFileDesc()));
-    extra.getQueue().add(kv);
-
-    String resource = instruction.getResource();
-    if (resource.startsWith("https://") || resource.startsWith("http://")) {
-      getUrlFile(state, extra, instruction);
-    } else {
-      getDbFile(state, extra, instruction);
-    }
-  }
 }
+
+

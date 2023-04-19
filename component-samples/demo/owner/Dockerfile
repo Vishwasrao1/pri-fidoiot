@@ -6,6 +6,12 @@ ARG _JAVA_OPTIONS
 ENV _JAVA_OPTIONS=${_JAVA_OPTIONS}
 RUN apt-get update 
 RUN apt-get install -y openjdk-11-jdk
+RUN apt-get update 
+RUN apt-get install -y curl
+RUN apt-get update 
+RUN apt-get install -y vim
+RUN apt-get update 
+RUN apt-get install -y jq
 
 RUN useradd -ms /bin/bash fdo
 WORKDIR /home/fdo/
@@ -28,3 +34,4 @@ USER fdo
 
 # Configure and start all-in-one
 CMD ["/usr/lib/jvm/java-11-openjdk-amd64/bin/java", "-jar", "aio.jar"]
+
